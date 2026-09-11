@@ -281,9 +281,35 @@ function showError(msg) {
     document.getElementById('submitBtn').textContent = '开始生成周报';
 }
 
+// 图片预处理：缩小尺寸加快OCR
+async function preprocessImage(file, maxWidth) {
+    maxWidth = maxWidth || 1200;
+    return new Promise(function(resolve) {
+        var img = new Image();
+        img.onload = function() {
+            if (img.width <= maxWidth) {
+                resolve(file);
+                return;
+            }
+            var canvas = document.createElement('canvas');
+            var ratio = maxWidth / img.width;
+            canvas.width = maxWidth;
+            canvas.height = Math.round(img.height * ratio);
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            canvas.toBlob(function(blob) {
+                resolve(blob);
+            }, 'image/jpeg', 0.95);
+        };
+        img.onerror = function() { resolve(file); };
+        img.src = URL.createObjectURL(file);
+    });
+}
+
 // OCR识别单张图片
 async function recognizeImage(file) {
-    const { data } = await ocrWorker.recognize(file);
+    var processed = await preprocessImage(file);
+    const { data } = await ocrWorker.recognize(processed);
     var blocks = [];
     if (data.words) {
         data.words.forEach(function(w) {
@@ -300,7 +326,82 @@ async function recognizeImage(file) {
             }
         });
     }
-    return blocks;
+    // 把同一行的字符合并成词
+    return mergeCharsToWords(blocks);
+}
+
+// 把同一行的字符合并成词（Tesseract中文按字返回，需要合并）
+function mergeCharsToWords(blocks) {
+    if (!blocks || blocks.length === 0) return [];
+    // 按y排序
+    var sorted = blocks.slice().sort(function(a, b) { return a.cy - b.cy; });
+    // 估算行高
+    var heights = sorted.map(function(b) { return b.height; }).filter(function(h) { return h > 0; });
+    var avgH = heights.length > 0 ? heights.reduce(function(a,b){return a+b;},0)/heights.length : 20;
+    var rowThreshold = avgH * 0.8;
+
+    // 按行聚类
+    var rows = [];
+    var currentRow = [sorted[0]];
+    var currentY = sorted[0].cy;
+    for (var i = 1; i < sorted.length; i++) {
+        if (Math.abs(sorted[i].cy - currentY) < rowThreshold) {
+            currentRow.push(sorted[i]);
+            currentY = currentRow.reduce(function(s,b){return s+b.cy;},0) / currentRow.length;
+        } else {
+            rows.push(currentRow);
+            currentRow = [sorted[i]];
+            currentY = sorted[i].cy;
+        }
+    }
+    rows.push(currentRow);
+
+    // 每行内按x排序，合并相邻字符合并成词
+    var merged = [];
+    rows.forEach(function(row) {
+        row.sort(function(a, b) { return a.cx - b.cx; });
+        // 估算字符宽度
+        var widths = row.map(function(b) { return b.x_max - b.x_min; }).filter(function(w) { return w > 0; });
+        var avgW = widths.length > 0 ? widths.reduce(function(a,b){return a+b;},0)/widths.length : 15;
+        var charGap = avgW * 0.8;
+
+        // 合并相邻字符
+        var words = [];
+        var currentWord = { text: row[0].text, x_min: row[0].x_min, x_max: row[0].x_max, cy: row[0].cy, y_min: row[0].y_min, y_max: row[0].y_max, height: row[0].height };
+        for (var i = 1; i < row.length; i++) {
+            var gap = row[i].x_min - currentWord.x_max;
+            if (gap < charGap) {
+                // 同一个词，合并
+                currentWord.text += row[i].text;
+                currentWord.x_max = row[i].x_max;
+                currentWord.y_min = Math.min(currentWord.y_min, row[i].y_min);
+                currentWord.y_max = Math.max(currentWord.y_max, row[i].y_max);
+                currentWord.height = currentWord.y_max - currentWord.y_min;
+            } else {
+                // 新的词
+                currentWord.cx = (currentWord.x_min + currentWord.x_max) / 2;
+                words.push(currentWord);
+                currentWord = { text: row[i].text, x_min: row[i].x_min, x_max: row[i].x_max, cy: row[i].cy, y_min: row[i].y_min, y_max: row[i].y_max, height: row[i].height };
+            }
+        }
+        currentWord.cx = (currentWord.x_min + currentWord.x_max) / 2;
+        words.push(currentWord);
+
+        merged = merged.concat(words);
+    });
+    return merged;
+}
+
+// 计算两个字符串的相似度（相同字符数/总长度）
+function stringSimilarity(a, b) {
+    if (!a || !b) return 0;
+    var setA = {};
+    for (var i = 0; i < a.length; i++) setA[a[i]] = true;
+    var common = 0;
+    for (var i = 0; i < b.length; i++) {
+        if (setA[b[i]]) common++;
+    }
+    return common / Math.max(a.length, b.length);
 }
 
 // 解析表格，提取目标人员工作内容
@@ -322,7 +423,7 @@ function parseBlocks(blocks, targetName) {
     });
 
     var columns = {};
-    if (headerBlocks.length > 0) {
+    if (headerBlocks.length >= 2) {
         headerBlocks.sort(function(a, b) { return a.cx - b.cx; });
         var personHb = null, deadlineHb = null;
         headerBlocks.forEach(function(hb) {
@@ -333,28 +434,22 @@ function parseBlocks(blocks, targetName) {
         var personLeft = 0, personRight = 0;
         if (personHb) {
             var px = personHb.cx;
+            // 人员列：找x接近、文本短（2-5字）的块
             var nameBlocks = blocks.filter(function(b) {
-                return Math.abs(b.cx - px) < 70 && b.text !== '人员' && b.text.length <= 5;
+                return Math.abs(b.cx - px) < 80 && b.text !== '人员' && b.text.length >= 2 && b.text.length <= 6;
             });
             if (nameBlocks.length > 0) {
                 personLeft = Math.min.apply(null, nameBlocks.map(function(b) { return b.x_min; })) - 20;
                 personRight = Math.max.apply(null, nameBlocks.map(function(b) { return b.x_max; })) + 25;
             } else {
-                personLeft = px - 50; personRight = px + 80;
+                personLeft = px - 60; personRight = px + 90;
             }
         }
 
         var deadlineLeft = 99999;
         if (deadlineHb) {
             var dx = deadlineHb.cx;
-            var dlBlocks = blocks.filter(function(b) {
-                return Math.abs(b.cx - dx) < 100 && b.text !== '完成时间节点' && b.text !== '完成时间';
-            });
-            if (dlBlocks.length > 0) {
-                deadlineLeft = Math.min.apply(null, dlBlocks.map(function(b) { return b.x_min; })) - 15;
-            } else {
-                deadlineLeft = dx - 60;
-            }
+            deadlineLeft = dx - 80;
         }
 
         columns = {
@@ -364,16 +459,17 @@ function parseBlocks(blocks, targetName) {
             deadline: [deadlineLeft, 99999]
         };
     } else {
-        // fallback：简单分4列
+        // fallback：按x坐标分4列
         var xs = blocks.map(function(b) { return b.cx; }).sort(function(a, b) { return a - b; });
         var n = xs.length;
-        var q1 = xs[Math.floor(n/4)], q2 = xs[Math.floor(n/2)], q3 = xs[Math.floor(3*n/4)];
-        columns = {
-            date: [0, (q1+q2)/2],
-            person: [(q1+q2)/2, (q2+q3)/2],
-            content: [(q2+q3)/2, (q3+xs[xs.length-1])/2],
-            deadline: [(q3+xs[xs.length-1])/2, 99999]
-        };
+        if (n >= 4) {
+            var q1 = xs[Math.floor(n*0.2)], q2 = xs[Math.floor(n*0.45)], q3 = xs[Math.floor(n*0.75)];
+            columns = {
+                date: [0, q1], person: [q1, q2], content: [q2, q3], deadline: [q3, 99999]
+            };
+        } else {
+            columns = { date: [0, 99999], person: [0, 99999], content: [0, 99999], deadline: [0, 99999] };
+        }
     }
 
     // 按列分类
@@ -388,23 +484,50 @@ function parseBlocks(blocks, targetName) {
         }
     });
 
-    // 找目标人员
-    var personBlocks = colBlocks.person.filter(function(b) { return b.text !== '人员'; })
-        .sort(function(a, b) { return a.cy - b.cy; });
+    // 找目标人员（模糊匹配）
+    var personBlocks = colBlocks.person.filter(function(b) {
+        return b.text !== '人员' && b.text.length >= 2;
+    }).sort(function(a, b) { return a.cy - b.cy; });
+
+    if (personBlocks.length === 0) {
+        // 如果人员列没人名，尝试在所有块中找
+        personBlocks = blocks.filter(function(b) {
+            return b.text.length >= 2 && b.text.length <= 6 && stringSimilarity(b.text, targetName) >= 0.5;
+        }).sort(function(a, b) { return a.cy - b.cy; });
+    }
 
     if (personBlocks.length === 0) {
         return { found: false, reason: '未识别到人员列' };
     }
 
+    // 模糊匹配目标人员：优先完全匹配，其次相似度>=0.6，再次包含姓
     var targetBlock = null;
     for (var i = 0; i < personBlocks.length; i++) {
         if (personBlocks[i].text.indexOf(targetName) !== -1) {
-            targetBlock = personBlocks[i];
-            break;
+            targetBlock = personBlocks[i]; break;
         }
     }
     if (!targetBlock) {
-        return { found: false, reason: '未找到' + targetName };
+        var bestScore = 0, bestIdx = -1;
+        for (var i = 0; i < personBlocks.length; i++) {
+            var score = stringSimilarity(personBlocks[i].text, targetName);
+            if (score > bestScore) { bestScore = score; bestIdx = i; }
+        }
+        if (bestScore >= 0.5 && bestIdx >= 0) {
+            targetBlock = personBlocks[bestIdx];
+        }
+    }
+    if (!targetBlock) {
+        // 最后尝试：包含姓
+        var surname = targetName.charAt(0);
+        for (var i = 0; i < personBlocks.length; i++) {
+            if (personBlocks[i].text.charAt(0) === surname && personBlocks[i].text.length >= 2) {
+                targetBlock = personBlocks[i]; break;
+            }
+        }
+    }
+    if (!targetBlock) {
+        return { found: false, reason: '未找到' + targetName + '（识别到的人员：' + personBlocks.map(function(b){return b.text;}).join('、') + '）' };
     }
 
     var targetY = targetBlock.cy;
@@ -444,7 +567,7 @@ function parseBlocks(blocks, targetName) {
     if (contentBlocks.length > 0) {
         var heights = contentBlocks.map(function(b) { return b.height; }).filter(function(h) { return h > 0; });
         var avgH = heights.length > 0 ? heights.reduce(function(a,b){return a+b;},0)/heights.length : 18;
-        var subThreshold = avgH * 0.7;
+        var subThreshold = avgH * 0.8;
 
         var subRows = [];
         var current = [contentBlocks[0]];
@@ -492,6 +615,23 @@ function parseBlocks(blocks, targetName) {
     if (!dateStr && deadline) {
         m = deadline.match(/(\d{1,2})月(\d{1,2})日/);
         if (m) dateStr = m[1] + '月' + m[2] + '日';
+    }
+
+    // 如果还是没日期，从所有完成时间中找出现最多的
+    if (!dateStr) {
+        var allDeadlines = colBlocks.deadline.map(function(b) { return b.text; });
+        var dateCounts = {};
+        allDeadlines.forEach(function(dt) {
+            var mm = dt.match(/(\d{1,2})月(\d{1,2})日/);
+            if (mm) {
+                var key = mm[1] + '月' + mm[2] + '日';
+                dateCounts[key] = (dateCounts[key] || 0) + 1;
+            }
+        });
+        var maxCount = 0;
+        for (var k in dateCounts) {
+            if (dateCounts[k] > maxCount) { maxCount = dateCounts[k]; dateStr = k; }
+        }
     }
 
     return {
